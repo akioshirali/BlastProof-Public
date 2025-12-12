@@ -1,0 +1,267 @@
+#@title ppoV2
+"""
+ppo_v2.py — Vectorized PPO for parallel environments
+
+This module implements:
+    • rollout()    — interacts with N parallel environments
+    • update()     — PPO clipped update using batched GAE
+    • PPOV2Trainer — primary trainer for fast large-batch RL
+
+Assumptions:
+    • envs is a vectorized environment exposing:
+          reset()        → list[obs] length N
+          step(actions)  → next_obs, rewards, dones, infos
+
+    • graph_builder must accept:
+          build_graph(obs) → PyG graph
+      for each environment independently.
+
+    • model must implement (for each graph):
+          logits, value = model(graph)
+
+Vectorization strategy:
+    • Environment interactions are vectorized
+    • Graph building is per-env (heterogeneous graph sizes)
+    • PPO update concatenates all timesteps × envs into a single batch
+"""
+
+from __future__ import annotations
+import numpy as np
+import torch
+import torch.nn as nn
+
+from .gae import compute_gae_batch
+from .utils import masked_logits_softmax
+
+
+# ======================================================================
+# PPO V2 — Vectorized Trainer
+# ======================================================================
+
+class PPOV2Trainer:
+    """
+    High-throughput PPO for vectorized training.
+
+    Args:
+        model:           policy/value network
+        graph_builder:   converts obs → graph
+        num_envs:        number of parallel environments
+        rollout_len:     unrolled steps before PPO update
+        lr:              learning rate
+        gamma:           discount factor
+        lam:             GAE lambda
+        clip_ratio:      PPO clipping parameter
+        train_iters:     gradient passes per PPO update
+        minibatch_size:  size of minibatches during optimization
+        device:          'cpu' or 'cuda'
+    """
+
+    def __init__(
+        self,
+        model,
+        graph_builder,
+        num_envs: int,
+        rollout_len: int = 128,
+        lr=3e-4,
+        gamma=0.99,
+        lam=0.95,
+        clip_ratio=0.2,
+        train_iters=4,
+        minibatch_size=4096,
+        device="cpu"
+    ):
+        self.model = model.to(device)
+        self.builder = graph_builder
+        self.num_envs = num_envs
+        self.rollout_len = rollout_len
+        self.device = device
+
+        self.gamma = gamma
+        self.lam = lam
+        self.clip_ratio = clip_ratio
+        self.train_iters = train_iters
+        self.minibatch_size = minibatch_size
+
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+
+    # ------------------------------------------------------------------
+    # Rollout collection
+    # ------------------------------------------------------------------
+
+    def rollout(self, envs):
+        """
+        Collect rollout_len steps across num_envs parallel environments.
+
+        Returns a dictionary:
+            {
+              "graphs":  list[T][N]
+              "actions": (T, N)
+              "logps":   (T, N)
+              "values":  (T+1, N)
+              "rewards": (T, N)
+              "dones":   (T, N)
+            }
+        """
+
+        N = self.num_envs
+        T = self.rollout_len
+
+        obs = envs.reset()
+        last_values = np.zeros(N, dtype=np.float32)
+
+        graphs = [[None for _ in range(N)] for _ in range(T)]
+        actions = np.zeros((T, N), dtype=np.int64)
+        logps = np.zeros((T, N), dtype=np.float32)
+        values = np.zeros((T + 1, N), dtype=np.float32)
+        rewards = np.zeros((T, N), dtype=np.float32)
+        dones = np.zeros((T, N), dtype=np.float32)
+
+        for t in range(T):
+            # Build graphs & choose actions
+            for i in range(N):
+                g = self.builder.build_graph(obs[i]).to(self.device)
+
+                with torch.no_grad():
+                    logits, value = self.model(g)
+
+                # Identify legal actions
+                node_x = g.x if hasattr(g, "x") else g["var"].x
+                legal = node_x[:, 0] == 0  # feature 0 = revealed flag
+
+                masked_logits, probs = masked_logits_softmax(logits, legal)
+                dist = torch.distributions.Categorical(probs)
+
+                action = dist.sample()
+                logp = dist.log_prob(action)
+
+                graphs[t][i] = g.cpu()
+                actions[t, i] = int(action.item())
+                logps[t, i] = float(logp.item())
+                values[t, i] = float(value)
+
+            # Step the environment batch
+            obs, r, d, info = envs.step(actions[t])
+
+            rewards[t] = np.asarray(r, dtype=np.float32)
+            dones[t] = np.asarray(d, dtype=np.float32)
+
+        # Bootstrap values after final timestep
+        for i in range(N):
+            g = self.builder.build_graph(obs[i]).to(self.device)
+            with torch.no_grad():
+                _, v = self.model(g)
+            values[T, i] = float(v)
+
+        return {
+            "graphs": graphs,
+            "actions": actions,
+            "logps": logps,
+            "values": values,
+            "rewards": rewards,
+            "dones": dones,
+        }
+
+    # ------------------------------------------------------------------
+    # PPO UPDATE
+    # ------------------------------------------------------------------
+
+    def update(self, batch):
+        """
+        Perform PPO update on vectorized rollout batch.
+
+        batch fields:
+            graphs:  list[T][N] PyG graphs
+            actions: (T, N)
+            logps:   (T, N)
+            values:  (T+1, N)
+            rewards: (T, N)
+            dones:   (T, N)
+        """
+
+        graphs = batch["graphs"]
+        actions = batch["actions"]
+        logps_old = batch["logps"]
+        values = batch["values"]
+        rewards = batch["rewards"]
+        dones = batch["dones"]
+
+        T, N = rewards.shape
+
+        # ---- Compute Advantages/Returns ----
+        adv, ret = compute_gae_batch(
+            rewards=rewards,
+            values=values,
+            dones=dones,
+            gamma=self.gamma,
+            lam=self.lam
+        )
+
+        # Normalize advantages
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        # Flatten batch (T*N)
+        total = T * N
+        actions = actions.reshape(total)
+        logps_old = logps_old.reshape(total)
+        adv = adv.reshape(total)
+        ret = ret.reshape(total)
+
+        # Build flat list of all graphs
+        flat_graphs = []
+        for t in range(T):
+            for i in range(N):
+                flat_graphs.append(graphs[t][i])
+
+        # ======================================================
+        # PPO optimization loop
+        # ======================================================
+
+        idxs = np.arange(total)
+
+        for _ in range(self.train_iters):
+            np.random.shuffle(idxs)
+
+            for start in range(0, total, self.minibatch_size):
+                batch_idx = idxs[start:start + self.minibatch_size]
+
+                # Compute new log probs and values
+                new_logps = []
+                new_values = []
+
+                for k in batch_idx:
+                    g = flat_graphs[k].to(self.device)
+                    logits, value = self.model(g)
+
+                    node_x = g.x if hasattr(g, "x") else g["var"].x
+                    legal = node_x[:, 0] == 0
+                    masked_logits, _ = masked_logits_softmax(logits, legal)
+
+                    logp_new = torch.log_softmax(masked_logits, dim=0)[actions[k]]
+                    new_logps.append(logp_new)
+                    new_values.append(value)
+
+                new_logps = torch.stack(new_logps)
+                new_values = torch.stack(new_values).squeeze()
+
+                # Convert relevant pieces
+                logps_old_b = torch.tensor(logps_old[batch_idx], device=self.device)
+                adv_b = torch.tensor(adv[batch_idx], device=self.device)
+                ret_b = torch.tensor(ret[batch_idx], device=self.device)
+
+                # --------------------------------------------------
+                # PPO losses
+                # --------------------------------------------------
+                ratio = torch.exp(new_logps - logps_old_b)
+                clipped = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio)
+
+                policy_loss = -torch.min(ratio * adv_b, clipped * adv_b).mean()
+                value_loss = ((ret_b - new_values) ** 2).mean()
+
+                entropy = -(torch.exp(new_logps) * new_logps).mean()
+
+                loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
+
+                # Optimize
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
