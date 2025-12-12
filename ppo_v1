@@ -1,0 +1,188 @@
+ 
+"""
+ppo_v1.py — Standard PPO Trainer (single–environment)
+
+This module implements:
+    • choose_action() — builds graph, masks illegal actions, samples action
+    • update()        — PPO clipped policy update with GAE
+    • PPOTrainer     — main interface used by curriculum training
+
+Requirements:
+    • graph_builder must expose build_graph(obs) → PyG (Data or HeteroData)
+    • model must return: logits, value = model(graph)
+"""
+
+from __future__ import annotations
+import numpy as np
+import torch
+import torch.nn as nn
+
+from .gae import compute_gae
+from .utils import masked_logits_softmax
+
+
+# ========================================================================
+# PPO Trainer (Single Environment)
+# ========================================================================
+
+class PPOTrainer:
+    """
+    Standard PPO trainer for sequential rollouts (single-env).
+
+    Args:
+        model: PyTorch module returning (logits, value).
+        graph_builder: converts obs → PyG graph.
+        lr: Adam learning rate.
+        gamma: discount factor
+        lam: GAE lambda
+        clip_ratio: PPO clipping parameter
+        train_iters: number of passes over buffer per update
+        batch_size: minibatch size
+        device: cpu or cuda
+    """
+
+    def __init__(
+        self,
+        model,
+        graph_builder,
+        lr=3e-4,
+        gamma=0.99,
+        lam=0.95,
+        clip_ratio=0.2,
+        train_iters=4,
+        batch_size=64,
+        device="cpu"
+    ):
+        self.model = model.to(device)
+        self.builder = graph_builder
+        self.device = device
+
+        self.gamma = gamma
+        self.lam = lam
+        self.clip_ratio = clip_ratio
+        self.train_iters = train_iters
+        self.batch_size = batch_size
+
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+
+    # ------------------------------------------------------------------
+    # Action selection
+    # ------------------------------------------------------------------
+
+    def choose_action(self, obs):
+        """
+        Build graph → run policy → sample action with masking.
+        Returns: action(int), logp(tensor), value(float), graph.
+        """
+
+        graph = self.builder.build_graph(obs).to(self.device)
+
+        with torch.no_grad():
+            logits, value = self.model(graph)
+
+        # Locate node features depending on PyG type
+        node_x = graph.x if hasattr(graph, "x") else graph["var"].x
+
+        # revealed = illegal (feature 0 is the revealed flag)
+        legal_mask = node_x[:, 0] == 0
+
+        masked_logits, probs = masked_logits_softmax(logits, legal_mask)
+        dist = torch.distributions.Categorical(probs)
+        action = dist.sample()
+        logp = dist.log_prob(action)
+
+        return int(action.item()), logp.detach(), float(value), graph
+
+    # ------------------------------------------------------------------
+    # PPO update
+    # ------------------------------------------------------------------
+
+    def update(self, buffer):
+        """
+        Run PPO update on rollout buffer.
+
+        buffer.* must contain:
+            actions: list[int]
+            rewards: list[float]
+            values:  list[float]
+            logps:   list[tensor]
+            states:  list[PyG graphs]
+            dones:   list[bool]
+        """
+
+        actions = torch.tensor(buffer.actions, dtype=torch.long, device=self.device)
+        old_logps = torch.stack(buffer.logps).to(self.device)
+
+        rewards = np.array(buffer.rewards, dtype=np.float32)
+        dones = np.array(buffer.dones, dtype=np.float32)
+        values_np = np.array(buffer.values + [0.0], dtype=np.float32)
+
+        # --- Compute advantages / returns ---
+        adv, ret = compute_gae(
+            rewards=rewards,
+            values=values_np,
+            dones=dones,
+            gamma=self.gamma,
+            lam=self.lam
+        )
+
+        adv = torch.tensor(adv, dtype=torch.float32, device=self.device)
+        ret = torch.tensor(ret, dtype=torch.float32, device=self.device)
+
+        # Normalize advantages (stable)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        # ======================================================
+        # PPO training loop
+        # ======================================================
+        n = len(actions)
+        idxs = np.arange(n)
+
+        for _ in range(self.train_iters):
+            np.random.shuffle(idxs)
+
+            for start in range(0, n, self.batch_size):
+                batch = idxs[start:start + self.batch_size]
+
+                batch_logps_new = []
+                batch_values_new = []
+
+                # Re-run model on stored graphs
+                for i in batch:
+                    g = buffer.states[i].to(self.device)
+                    logits, value = self.model(g)
+
+                    # Mask illegal again
+                    node_x = g.x if hasattr(g, "x") else g["var"].x
+                    legal = node_x[:, 0] == 0
+
+                    masked_logits, _ = masked_logits_softmax(logits, legal)
+                    logp_new = torch.log_softmax(masked_logits, dim=0)[actions[i]]
+
+                    batch_logps_new.append(logp_new)
+                    batch_values_new.append(value)
+
+                batch_logps_new = torch.stack(batch_logps_new)
+                batch_values_new = torch.stack(batch_values_new).squeeze()
+
+                # PPO loss terms
+                ratio = torch.exp(batch_logps_new - old_logps[batch])
+                clip = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio)
+
+                policy_loss = -torch.min(
+                    ratio * adv[batch],
+                    clip * adv[batch]
+                ).mean()
+
+                value_loss = ((ret[batch] - batch_values_new) ** 2).mean()
+
+                entropy = -(torch.exp(batch_logps_new) * batch_logps_new).mean()
+
+                loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
+
+                # Optimize
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+        buffer.clear()
